@@ -118,18 +118,31 @@ class CleanerBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True
         intents.guilds = True
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        if ALLOWED_GUILD_ID:
-            guild = discord.Object(id=ALLOWED_GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        print(f"Синк команд: guild={ALLOWED_GUILD_ID}")
+        try:
+            if ALLOWED_GUILD_ID:
+                guild = discord.Object(id=ALLOWED_GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                print("Команды на сервере:", [c.name for c in synced])
+            synced_global = await self.tree.sync()
+            print("Глобальные команды:", [c.name for c in synced_global])
+        except Exception as exc:
+            print("ОШИБКА СИНКА КОМАНД:", type(exc).__name__, exc)
 
 
 bot = CleanerBot()
+
+
+def slash_command(name: str, description: str):
+    kwargs = {"name": name, "description": description}
+    if ALLOWED_GUILD_ID:
+        kwargs["guild"] = discord.Object(id=ALLOWED_GUILD_ID)
+    return bot.tree.command(**kwargs)
 
 
 def require_operator(interaction: discord.Interaction) -> str | None:
@@ -154,7 +167,7 @@ async def ask_confirm(interaction: discord.Interaction, summary: str) -> bool:
     return True
 
 
-@bot.tree.command(name="preview", description="Показать, что будет удалено/кикнуто (без действий)")
+@slash_command(name="preview", description="Показать, что будет удалено/кикнуто (без действий)")
 @app_commands.describe(
     keep_channels="ID каналов через запятую, которые оставить",
     keep_role="Роль, у кого есть она — не кикать",
@@ -200,7 +213,7 @@ async def preview(
     )
 
 
-@bot.tree.command(name="wipe_channels", description="Удалить каналы, кроме указанных и текущего")
+@slash_command(name="wipe_channels", description="Удалить каналы, кроме указанных и текущего")
 @app_commands.describe(keep_channels="ID каналов через запятую, которые оставить")
 async def wipe_channels(interaction: discord.Interaction, keep_channels: str | None = None):
     err = require_operator(interaction)
@@ -238,7 +251,7 @@ async def wipe_channels(interaction: discord.Interaction, keep_channels: str | N
     )
 
 
-@bot.tree.command(name="kick_unwanted", description="Кикнуть участников без нужной роли")
+@slash_command(name="kick_unwanted", description="Кикнуть участников без нужной роли")
 @app_commands.describe(
     keep_role="Кого с этой ролью не трогать. Без роли — кик всех, кроме владельца и тебя",
     kick_bots="Кикать других ботов",
@@ -280,7 +293,7 @@ async def kick_unwanted(
     )
 
 
-@bot.tree.command(name="wipe_roles", description="Удалить роли, которые бот может удалить")
+@slash_command(name="wipe_roles", description="Удалить роли, которые бот может удалить")
 async def wipe_roles(interaction: discord.Interaction):
     err = require_operator(interaction)
     if err:
@@ -447,7 +460,7 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
     )
 
 
-@bot.tree.command(
+@slash_command(
     name="nuke",
     description="Полностью очистить ЭТОТ сервер: люди, каналы, роли, эмодзи",
 )
@@ -520,16 +533,69 @@ def format_names(names: Iterable[str]) -> str:
     return ", ".join(items)
 
 
+@bot.command(name="sync")
+async def prefix_sync(ctx: commands.Context):
+    if not isinstance(ctx.author, discord.Member) or not is_operator(ctx.author):
+        return
+    if not guild_allowed(ctx.guild):
+        await ctx.send("Не тот сервер.")
+        return
+    guild = discord.Object(id=ALLOWED_GUILD_ID)
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    names = ", ".join(c.name for c in synced) or "пусто"
+    await ctx.send(f"Синкнул команды: {names}")
+
+
+@bot.command(name="nuke")
+async def prefix_nuke(ctx: commands.Context, confirm: str = ""):
+    if not isinstance(ctx.author, discord.Member) or not is_operator(ctx.author):
+        return
+    if not guild_allowed(ctx.guild):
+        await ctx.send("Не тот сервер.")
+        return
+    if confirm.strip().upper() != "NUKE":
+        await ctx.send("Напиши так: `!nuke NUKE`")
+        return
+    guild = ctx.guild
+    assert guild is not None
+    if not guild.chunked:
+        await guild.chunk()
+    people = members_to_kick(guild, guild.me, keep_role=None, kick_bots=True)
+    view = ConfirmView(ctx.author.id)
+    view.message = await ctx.send(
+        (
+            f"**Полная очистка {guild.name}**\n"
+            f"Кик: **{len(people)}**\n"
+            f"Потом каналы {MOVE_INVITE} и роль Admin.\n"
+            f"Нажми **Подтвердить**."
+        ),
+        view=view,
+    )
+    timed_out = await view.wait()
+    if timed_out or not view.confirmed:
+        return
+    report = await nuke_guild(guild, ctx.author)
+    await ctx.send(report)
+
+
 @bot.event
 async def on_ready():
     print(f"Вошёл как {bot.user} (id={bot.user.id if bot.user else '?'})")
     if ALLOWED_GUILD_ID:
         print(f"Разрешён только сервер {ALLOWED_GUILD_ID}")
+    if bot.user:
+        invite = (
+            "https://discord.com/oauth2/authorize?client_id="
+            f"{bot.user.id}&permissions=8&scope=bot%20applications.commands"
+        )
+        print("Если нет /nuke — кикни бота и пригласи заново по ссылке:")
+        print(invite)
 
 
 def main():
-    if not TOKEN:
-        raise SystemExit("Нет DISCORD_TOKEN в .env")
+    if not TOKEN or TOKEN.lower() in {"changeme", "вставь_токен_бота"}:
+        raise SystemExit("Нет DISCORD_TOKEN")
     if not ALLOWED_GUILD_ID:
         raise SystemExit("Укажи ALLOWED_GUILD_ID в .env — бот работает только на твоём сервере")
     if not ALLOWED_USER_IDS:
